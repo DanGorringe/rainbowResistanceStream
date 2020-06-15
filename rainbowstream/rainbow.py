@@ -22,15 +22,17 @@ from twitter.util import printNicely
 
 from pocket import Pocket
 
-from .draw import *
-from .colors import *
-from .config import *
-from .consumer import *
-from .interactive import *
-from .c_image import *
-from .py3patch import *
-from .emoji import *
-from .util import *
+from draw import *
+from colors import *
+from config import *
+from consumer import *
+from interactive import *
+from c_image import *
+from py3patch import *
+from emoji import *
+from util import *
+from mstdn import *
+from crypt import *
 
 # Global values
 g = {}
@@ -257,7 +259,8 @@ def init(args):
     g['decorated_name'] = lambda x: color_func(
         c['DECORATED_NAME'])('[' + x + ']: ', rl=True)
     # Theme init
-    files = os.listdir(os.path.dirname(__file__) + '/colorset')
+    #files = os.listdir(os.path.dirname(__file__) + '/colorset')
+    files = './colorset'
     themes = [f.split('.')[0] for f in files if f.split('.')[-1] == 'json']
     g['themes'] = themes
     g['pause'] = False
@@ -332,6 +335,8 @@ def poll():
     Fetch stream based on since_id
     """
     t = Twitter(auth=authen())
+    # and add a mastodon instance - d
+    m = Mastodon(access_token=MSTDN_ACCESS_TKN,api_base_url=MSTDN_BASE_URL)
 
     num = c['HOME_TWEET_NUM']
     kwargs = {'count': num}
@@ -343,8 +348,24 @@ def poll():
     result = t.statuses.home_timeline(**kwargs)
     if result:
         g['since_id'] = result[0]['id']
+
+    # Preserve above stuff
+    # and append mastodon posts to result.
+    if 'since_id_mstdn' not in g:
+        g['since_id_mstdn'] = 0
+
+    # get tweets
+    result_mstdn = m.timeline(since_id=g['since_id_mstdn'])
+    if result_mstdn:
+        g['since_id_mstdn'] = result_mstdn[0]['id']
+        for post in result_mstdn:
+            result.append(ConvertMtoT(post))
+
     for tweet in reversed(result):
-        draw(t=tweet)
+        try: # Doesn't like all images from mstdn
+            draw(t=tweet)
+        except:
+            print('Could not draw post')
     if result:
         printNicely('')
 
@@ -494,6 +515,117 @@ def tweet():
     t = Twitter(auth=authen())
     t.statuses.update(status=g['stuff'])
 
+
+def toot():
+    """
+    Toot
+     (use the same kinda usage to previous method in order to post to mstdn)
+    """
+    m = Mastodon(access_token=MSTDN_ACCESS_TKN,api_base_url=MSTDN_BASE_URL)
+    m.status_post(g['stuff'])
+
+def encryptedTweet(msg):
+    """
+    produce and post encrypted post
+    """
+    #print('HERE')
+    text,key,nonce = EncryptText(msg)
+    #print('HERE')
+    #print(text)
+
+    text = ByteToString(text)
+
+    # Post Encrypted text
+    t = Twitter(auth=authen())
+    #print('test')
+    tInfo = t.statuses.update(status=text)
+    draw(tInfo)
+    print('')
+    tid = tInfo['id']
+
+    targets = LoadTargetJSON()
+    #print(targets)
+
+    # replies
+    for user in targets:
+        #print(user)
+        userKey = RSA.importKey(targets[user]['key'])
+        userName = targets[user]['username_twitter']
+        key_encrypted,nonce_encrypted = RetweetKeyAndNonce(userKey,key,nonce)
+        twt = '@'+userName+' '+ByteToString(key_encrypted)+' '+ByteToString(nonce_encrypted)
+        #print(twt)
+        t.statuses.update(status=twt, in_reply_to_status_id=tid)
+
+    # And post to mastdn
+    toot()
+
+
+def FindReplySelf(posts,tid,seachPrefix):
+    """
+    Find the reply addressed to me
+    """
+    for r in posts['statuses']:
+        if r['in_reply_to_status_id'] == tid:
+            if seachPrefix in r['text']:
+                return r
+    return None
+
+
+def decryptTweet():
+    """
+    Decrypt a tweet and draw
+    """
+    t = Twitter(auth=authen())
+
+    # Get TID to decrypt (and find replies of)
+    try:
+        id = int(g['stuff'].split()[0])
+    except:
+        printNicely(red('Sorry I can\'t understand.'))
+        return
+    tid = c['tweet_dict'][id]
+
+    # Get all that info
+    x = t.statuses.show(_id=tid, _method='GET')
+
+    # Finding replies ain't that simple
+
+    # search query
+    q = 'to:'+str(x['user']['screen_name'])
+    potentialReplies = t.search.tweets(q=q,since_id=tid)
+
+    credential = t.account.verify_credentials()
+    nameSelf = '@' + credential['screen_name']
+
+    reply = FindReplySelf(potentialReplies,tid,nameSelf)
+    replyTxt = reply['text']
+    #print(replyTxt)
+
+    privKey,pubKey = LoadKeyPairPEM()
+    #print('keyaloded')
+
+    privKey = RSA.importKey(privKey)
+    #print('key imported')
+
+    #print(x['text'])
+    #print(replyTxt)
+
+    txt = DecryptTweet(x['text'],replyTxt,privKey)
+
+    #print('HERE')
+
+    #print(str(txt)[2:-1])
+
+    x['text'] = str(txt)[2:-1]
+    draw(t=x)
+    print('')
+
+def crossTweet():
+    """
+    Toot unencrypted
+    Tweet encrypted
+    """
+    encryptedTweet(g['stuff'])
 
 def pocket():
     """
@@ -1915,6 +2047,9 @@ cmdset = [
     'view',
     'mentions',
     't',
+    'm', # Added this one - to mastdn post
+    'resist', # and this to cross tweet
+    'decrypt',
     'rt',
     'quote',
     'me',
@@ -1965,6 +2100,9 @@ funcset = [
     view,
     mentions,
     tweet,
+    toot, # Added here too
+    crossTweet, # This too
+    decryptTweet, # ^
     retweet,
     quote,
     view_my_tweets,
@@ -2028,6 +2166,9 @@ def listen():
             ['@'],  # view
             [],  # mentions
             [],  # tweet
+            [],  # toot - I added this
+            [],  # resist - Added also
+            [],  # decrypt - ^
             [],  # retweet
             [],  # quote
             [],  # view_my_tweets
@@ -2273,6 +2414,7 @@ def fly():
     """
     # Initial
     args = parse_arguments()
+    #print('Your args are: '+str(args))
     try:
         proxy_connect(args)
         init(args)
